@@ -42,6 +42,7 @@ contract Pethreon {
     }
 
     enum Status {
+        DOES_NOT_EXIST,
         ACTIVE,
         CANCELLED,
         EXPIRED
@@ -49,8 +50,6 @@ contract Pethreon {
 
     /***** DATA STRUCTURES *****/
     struct Pledge {
-        address creatorAddress;
-        address contributorAddress;
         uint256 weiPerPeriod;
         uint256 duration;
         uint256 dateCreated;
@@ -58,13 +57,17 @@ contract Pethreon {
         Status status;
     }
 
+    // (contributorAddress + creatorAddress) => Pledge
+    mapping(bytes32 => Pledge) pledges;
+
+    // contributorAddress => ...
     mapping(address => uint256) contributorBalances;
-    mapping(address => Pledge[]) contributorPledges;
+    mapping(address => address[]) peopleIDonatedTo;
 
-    mapping(address => Pledge[]) creatorActivePledges;
-    mapping(address => Pledge[]) creatorExpiredPledges;
+    // creatorAddress => ...
+    mapping(address => Pledge[]) expiredPledges;
+    mapping(address => address[]) peopleWhoDonatedToMe;
     mapping(address => uint256) lastWithdrawalPeriod;
-
     mapping(address => mapping(uint256 => uint256)) expectedPayments; // creatorAddress => (periodNumber => payment)
 
     function currentPeriod() public view returns (uint256 periodNumber) {
@@ -86,7 +89,7 @@ contract Pethreon {
 
     function creatorWithdraw() public returns (uint256 newBalance) {
         uint256 amount = getCreatorBalance(); // add up all their pledges SINCE their last withdrawal period
-        lastWithdrawalPeriod[msg.sender] = currentPeriod(); // set a new withdrawal period (re-entrancy?)
+        lastWithdrawalPeriod[msg.sender] = currentPeriod(); // set a new withdrawal period (re-entrancy)
         require(amount > 0, "Nothing to withdraw");
         (bool success, ) = payable(msg.sender).call{value: amount}(""); // send them money
         require(success, "withdrawal failed");
@@ -120,20 +123,41 @@ contract Pethreon {
         return contributorBalances[msg.sender];
     }
 
-    function getContributorPledges()
+    function getPledgesForContributor()
         public
-        view
-        returns (Pledge[] memory allPledges)
+        pure
+        returns (uint[] memory allPledges)
     {
-        return contributorPledges[msg.sender];
+        uint[] memory _pledges;
+        _pledges[0] = 111111111;
+        _pledges[1] = 222222222;
+
+        return _pledges;
     }
 
-    function getCreatorPledges()
+    function getPledgesForCreator(bool grabExpiredPledgesToo)
         public
         view
         returns (Pledge[] memory allPledges)
     {
-        return creatorActivePledges[msg.sender];
+        address[] memory people = peopleWhoDonatedToMe[msg.sender];
+        Pledge[] memory _pledges;
+
+        // Grab all active pledges...
+        for (uint256 i = 0; i < people.length; i++) {
+            _pledges[i] = pledges[keccak256(abi.encode(msg.sender, people[i]))];
+        }
+
+        if (grabExpiredPledgesToo) {
+            Pledge[] storage _expiredPledges = expiredPledges[msg.sender];
+            for (uint256 i = _pledges.length; i < _expiredPledges.length; i++) {
+                _pledges[i] = pledges[
+                    keccak256(abi.encode(msg.sender, people[i]))
+                ];
+            }
+        }
+
+        return _pledges;
     }
 
     function createPledge(
@@ -148,21 +172,27 @@ contract Pethreon {
 
         contributorBalances[msg.sender] -= _weiPerPeriod * _periods; // subtract first to prevent re-entrancy
 
-        Pledge[] memory pledges = contributorPledges[msg.sender];
-
-        for (uint256 i = 0; i < pledges.length; i++) {
-            if (pledges[i].creatorAddress == _creatorAddress) {
-                require(
-                    currentPeriod() >= pledges[i].periodExpires,
-                    "You're only allowed to have one active pledge at at time, cancel your existing one first or wait until it expires"
-                );
-                Pledge memory expiredPledge = pledges[i];
-                expiredPledge.status = Status.EXPIRED;
-                creatorExpiredPledges[_creatorAddress].push(expiredPledge);
-                deletePledge(_creatorAddress);
-            }
+        if (
+            pledges[keccak256(abi.encode(msg.sender, _creatorAddress))]
+                .status == Status.DOES_NOT_EXIST
+        ) {
+            peopleIDonatedTo[msg.sender].push(_creatorAddress);
+            peopleWhoDonatedToMe[_creatorAddress].push(msg.sender);
+        } else {
+            Pledge memory pledge = pledges[
+                keccak256(abi.encode(msg.sender, _creatorAddress))
+            ];
+            require(
+                currentPeriod() >= pledge.periodExpires,
+                "You're only allowed to have one active Pledge at a time, cancel your existing pledge first or wait until it expires"
+            );
+            Pledge memory expiredPledge = pledge;
+            expiredPledge.status = Status.EXPIRED;
+            expiredPledges[_creatorAddress].push(expiredPledge);
+            delete pledges[keccak256(abi.encode(msg.sender, _creatorAddress))];
         }
 
+        // I pulled this out here because I was worried the currentPeriod might change while it's looping possibly?
         uint256 _currentPeriod = currentPeriod();
 
         // Update the CREATOR'S list of future payments
@@ -174,9 +204,7 @@ contract Pethreon {
             expectedPayments[_creatorAddress][_period] += _weiPerPeriod;
         }
 
-        Pledge memory pledge = Pledge({
-            creatorAddress: _creatorAddress,
-            contributorAddress: msg.sender,
+        Pledge memory newPledge = Pledge({
             weiPerPeriod: _weiPerPeriod,
             duration: _periods,
             dateCreated: block.timestamp,
@@ -184,8 +212,7 @@ contract Pethreon {
             status: Status.ACTIVE
         });
 
-        contributorPledges[msg.sender].push(pledge);
-        creatorActivePledges[_creatorAddress].push(pledge);
+        pledges[keccak256(abi.encode(msg.sender, _creatorAddress))] = newPledge;
 
         emit PledgeCreated(
             currentPeriod(),
@@ -196,10 +223,11 @@ contract Pethreon {
         );
     }
 
-    // This can get expensive but I doubt it will happen very often
-    // I should come up with a better way to do this
     function cancelPledge(address _creatorAddress) public {
-        Pledge memory pledge = deletePledge(_creatorAddress); // (re-entrancy)
+        Pledge memory pledge = pledges[
+            keccak256(abi.encode(msg.sender, _creatorAddress))
+        ];
+        delete pledges[keccak256(abi.encode(msg.sender, _creatorAddress))]; // prevent re-entrancy
 
         for (
             uint256 _period = currentPeriod(); // grab the current period
@@ -209,40 +237,14 @@ contract Pethreon {
             expectedPayments[_creatorAddress][_period] -= pledge.weiPerPeriod;
         }
 
-        Pledge[] storage creatorPledgesBefore = creatorActivePledges[
-            _creatorAddress
-        ];
-
-        for (uint256 i = 0; i < creatorPledgesBefore.length; i++) {
-            if (creatorPledgesBefore[i].contributorAddress == msg.sender) {
-                creatorPledgesBefore[i].periodExpires = currentPeriod();
-                creatorPledgesBefore[i].status = Status.CANCELLED;
-            }
-        }
+        pledge.periodExpires = currentPeriod();
+        pledge.status = Status.CANCELLED;
+        expiredPledges[_creatorAddress].push(pledge);
 
         contributorBalances[msg.sender] +=
             pledge.weiPerPeriod *
             (pledge.periodExpires - currentPeriod());
 
         emit PledgeCancelled(currentPeriod(), _creatorAddress, msg.sender);
-    }
-
-    function deletePledge(address _creatorAddress)
-        internal
-        returns (Pledge memory)
-    {
-        Pledge[] storage pledges = contributorPledges[msg.sender];
-        Pledge memory pledge;
-
-        for (uint256 i = 0; i < pledges.length; i++) {
-            if (pledges[i].creatorAddress == _creatorAddress) {
-                pledge = pledges[i];
-                pledges[i] = pledges[pledges.length - 1];
-                pledges[pledges.length - 1] = pledge;
-            }
-        }
-
-        pledges.pop(); // remove the pledge we want to cancel from the contributor's mapping (early removal prevents re-entrancy)
-        return pledge;
     }
 }
